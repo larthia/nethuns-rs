@@ -1,15 +1,13 @@
-use core::cell::UnsafeCell;
+//! Single-producer single-consumer queue implementation.
 
-use core::sync::atomic;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use arrayvec::ArrayVec;
-use atomic::{AtomicUsize, Ordering};
 use ringbuf::storage::Heap;
 use ringbuf::traits::Split;
 use ringbuf::wrap::Wrap;
 use ringbuf::{CachingCons, CachingProd, HeapRb, SharedRb};
-
 
 pub(crate) struct Producer<T> {
     producer: CachingProd<Arc<SharedRb<Heap<T>>>>,
@@ -24,34 +22,25 @@ impl<T> Producer<T> {
         Arc::as_ptr(&self.producer.rb_ref()) as usize
     }
 
-    pub(crate) fn new(producer: CachingProd<Arc<SharedRb<Heap<T>>>>, id: usize) -> Self {
+    pub(crate) fn new(producer: CachingProd<Arc<SharedRb<Heap<T>>>>, _id: usize) -> Self {
         Self { producer }
     }
 }
 
 pub(crate) struct Consumer<T> {
-    // we have to promise that the consumer is only used by one thread
+    // We have to promise that the consumer is only used by one thread
     pub(crate) consumer: UnsafeCell<CachingCons<Arc<SharedRb<Heap<T>>>>>,
 }
 
 impl<T> Consumer<T> {
-    // # Safety
-    // Exclusive access must be enforced by the caller
-    // #[inline(always)]
-    // pub unsafe fn dequeue_many<const N: usize>(&self, data: &mut ArrayVec<T, { N }>) {
-    //     let consumer = unsafe { &mut *self.consumer.get() };
-    //     let remaining = data.capacity() - data.len();
-    //     for scan in ringbuf::traits::Consumer::pop_iter(consumer).take(remaining) {
-    //         unsafe { data.push_unchecked(scan) };
-    //     }
-    // }
-
+    /// # Safety
+    /// Exclusive access must be enforced by the caller
     pub(crate) unsafe fn id(&self) -> usize {
         let tmp = unsafe { (*self.consumer.get()).rb_ref() };
         Arc::as_ptr(tmp) as usize
     }
 
-    pub(crate) fn new(consumer: CachingCons<Arc<SharedRb<Heap<T>>>>, id: usize) -> Self {
+    pub(crate) fn new(consumer: CachingCons<Arc<SharedRb<Heap<T>>>>, _id: usize) -> Self {
         Self {
             consumer: UnsafeCell::new(consumer),
         }

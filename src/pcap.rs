@@ -3,10 +3,7 @@
 
 use std::{
     cell::RefCell,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use pcap::{Active, Capture, Device, Offline, Packet};
@@ -98,14 +95,20 @@ impl Context for PcapContext {
     /// Caller (your `Payload`) guarantees exclusive access to this buffer
     /// until `release()` is called via `Drop`.
     unsafe fn unsafe_buffer(&self, buf_idx: BufferDesc, size: usize) -> *mut [u8] {
-        let ptr = usize::from(buf_idx) as *mut u8;
+        // The actual data starts after the 8-byte size header
+        let ptr = (usize::from(buf_idx) + std::mem::size_of::<usize>()) as *mut u8;
         std::ptr::slice_from_raw_parts_mut(ptr, size)
     }
 
     fn release(&self, buf_idx: BufferDesc) {
-        let ptr = usize::from(buf_idx) as *mut u8;
+        let base_ptr = usize::from(buf_idx) as *mut usize;
         unsafe {
-            let _ = Box::from_raw(std::slice::from_raw_parts_mut(ptr, self.buf_capacity));
+            // Read the stored buffer size from the header
+            let buf_size = *base_ptr;
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(
+                base_ptr as *mut u8,
+                buf_size,
+            ));
         }
     }
 }
@@ -158,7 +161,25 @@ impl Socket for Sock {
             caplen: pkt.header.caplen,
         };
 
-        let res = vec![0u8; ctx.buf_capacity].into_boxed_slice();
+        // Allocate buffer with size header (usize) + packet data.
+        // We use len.max(buf_capacity) to ensure:
+        // - Small packets get a consistent minimum buffer size (buf_capacity) for potential reuse
+        // - Large packets (bigger than buf_capacity) still fit without truncation
+        // The actual packet length is stored in the Token, so we always know the real data size.
+        let header_size = std::mem::size_of::<usize>();
+        let data_size = len.max(ctx.buf_capacity);
+        let buf_size = header_size + data_size;
+        let mut res = vec![0u8; buf_size].into_boxed_slice();
+
+        // Store the total buffer size at the beginning
+        let size_ptr = res.as_mut_ptr() as *mut usize;
+        unsafe {
+            *size_ptr = buf_size;
+        }
+
+        // Copy the packet data after the header
+        res[header_size..header_size + len].copy_from_slice(data);
+
         let ptr = Box::into_raw(res) as *mut u8;
         let buf_desc = BufferDesc(ptr as usize);
         let token = Token::new(buf_desc, ctx.pool_id(), len as u32);

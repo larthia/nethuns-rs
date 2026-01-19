@@ -1,4 +1,4 @@
-use std::simd::usizex16;
+//! Consumer list implementation for MPSC channel.
 
 use triomphe::Arc;
 
@@ -36,10 +36,7 @@ impl<T> ConsumerList<T> {
     pub(crate) fn remove(&mut self, id: usize) {
         let mut list = self.list.lock();
         let len = list.len();
-        // We have exclusive access to the list, so we can safely remove the consumer
-        unsafe { 
-            list.retain(|x| x.id() != id);
-        }
+        list.retain(|x| unsafe { x.id() } != id);
         assert!(list.len() == len - 1);
     }
 
@@ -50,25 +47,18 @@ impl<T> ConsumerList<T> {
             callback(value);
         }
     }
-
 }
 
-
-
+/// Pop all available elements from all producer queues.
 #[inline(never)]
 #[cold]
-pub fn pop_all<const N: usize>(me: &mut ConsumerList<usizex16>, v: &mut ArrayVec<usize, { N }>) {
+pub fn pop_all<const N: usize>(me: &mut ConsumerList<usize>, v: &mut ArrayVec<usize, N>) {
     me.for_each(|consumer| {
         let consumer = unsafe { &mut *consumer.consumer.get() };
-        let remaining = (v.capacity() - v.len()) / 16;
+        let remaining = v.capacity() - v.len();
         for scan in ringbuf::traits::Consumer::pop_iter(consumer).take(remaining) {
-            unsafe {
-                let len = v.len();
-                let ptr = v.as_mut_ptr().add(len);
-                let ptr = ptr as *mut usizex16;
-                std::ptr::write(ptr, scan);
-                v.set_len(len + 16);
-            }
+            // SAFETY: we checked remaining capacity above
+            unsafe { v.push_unchecked(scan) };
         }
     });
 }

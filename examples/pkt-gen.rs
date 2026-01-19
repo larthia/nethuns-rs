@@ -16,8 +16,16 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use etherparse::PacketBuilder;
-use nethuns_rs::{af_xdp, api::Socket, dpdk, netmap};
+use nethuns_rs::api::Socket;
 use std::net::Ipv4Addr;
+
+// Conditional imports for platform-specific backends
+#[cfg(all(target_os = "linux", feature = "af_xdp"))]
+use nethuns_rs::af_xdp;
+#[cfg(all(target_os = "linux", feature = "dpdk"))]
+use nethuns_rs::dpdk;
+#[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
+use nethuns_rs::netmap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -100,12 +108,15 @@ struct Args {
 #[derive(Subcommand, Debug, Clone)]
 enum Framework {
     /// Use **netmap**.
+    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
     Netmap(NetmapArgs),
     /// Use **AF_XDP**.
+    #[cfg(all(target_os = "linux", feature = "af_xdp"))]
     AfXdp(AfXdpArgs),
     /// Use **DPDK**.
+    #[cfg(all(target_os = "linux", feature = "dpdk"))]
     Dpdk(DpdkArgs),
-    // Use **pcap** (for testing / low speed).
+    /// Use **pcap** (for testing / low speed).
     Pcap(PcapArgs),
 }
 
@@ -137,6 +148,7 @@ struct PcapArgs {
 }
 
 // ───────────────────────── netmap specific ────────────────────────────
+#[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
 #[derive(Parser, Debug, Clone)]
 struct NetmapArgs {
     #[clap(long, default_value_t = 1024)]
@@ -148,6 +160,7 @@ struct NetmapArgs {
 }
 
 // ───────────────────────── dpdk specific ──────────────────────────────
+#[cfg(all(target_os = "linux", feature = "dpdk"))]
 #[derive(Parser, Debug, Clone)]
 struct DpdkArgs {
     #[clap(long, default_value_t = 8192)]
@@ -163,6 +176,7 @@ struct DpdkArgs {
 }
 
 // ───────────────────────── af_xdp specific ────────────────────────────
+#[cfg(all(target_os = "linux", feature = "af_xdp"))]
 #[derive(Parser, Debug, Clone)]
 struct AfXdpArgs {
     #[clap(long, default_value_t = 0)]
@@ -412,12 +426,14 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     match &args.framework {
+        #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
         Framework::Netmap(nm) => {
             let flags = netmap::NetmapFlags {
                 extra_buf: nm.extra_buf,
             };
             run_tx::<netmap::Sock>(flags, &args)?;
         }
+        #[cfg(all(target_os = "linux", feature = "af_xdp"))]
         Framework::AfXdp(xdp) => {
             let flags = af_xdp::AfXdpFlags {
                 bind_flags: xdp.bind_flags,
@@ -429,6 +445,7 @@ fn main() -> Result<()> {
             };
             run_tx::<af_xdp::Sock>(flags, &args)?;
         }
+        #[cfg(all(target_os = "linux", feature = "dpdk"))]
         Framework::Dpdk(dp) => {
             let flags = dpdk::DpdkFlags {
                 num_mbufs: dp.num_mbufs,

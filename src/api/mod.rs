@@ -4,7 +4,13 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-use crate::{af_xdp, dpdk, netmap};
+// Conditional imports for platform-specific backends
+#[cfg(all(target_os = "linux", feature = "af_xdp"))]
+use crate::af_xdp;
+#[cfg(all(target_os = "linux", feature = "dpdk"))]
+use crate::dpdk;
+#[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
+use crate::netmap;
 
 pub type Result<T> = std::result::Result<T, crate::errors::Error>;
 
@@ -376,11 +382,11 @@ const _: () = const {
             todo!()
         }
 
-        unsafe fn unsafe_buffer(&self, buf_idx: BufferDesc, size: usize) -> *mut [u8] {
+        unsafe fn unsafe_buffer(&self, _buf_idx: BufferDesc, _size: usize) -> *mut [u8] {
             todo!()
         }
 
-        fn release(&self, buf_idx: BufferDesc) {
+        fn release(&self, _buf_idx: BufferDesc) {
             todo!()
         }
     }
@@ -459,10 +465,22 @@ pub trait Metadata: Send {
     fn into_enum(self) -> MetadataType;
 }
 
+/// Enum containing metadata types from different backends.
+/// Only backends enabled via features are included.
 pub enum MetadataType {
+    /// Netmap metadata (Linux/FreeBSD only, requires `netmap` feature)
+    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
     Netmap(netmap::Meta),
+
+    /// AF_XDP metadata (Linux only, requires `af_xdp` feature)
+    #[cfg(all(target_os = "linux", feature = "af_xdp"))]
     AfXdp(af_xdp::Meta),
+
+    /// DPDK metadata (Linux only, requires `dpdk` feature)
+    #[cfg(all(target_os = "linux", feature = "dpdk"))]
     Dpdk(dpdk::Meta),
+
+    /// Pcap metadata (available on all platforms)
     Pcap(crate::pcap::Meta),
 }
 

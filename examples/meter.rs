@@ -1,15 +1,37 @@
-//mod fake_refcell;
-use anyhow::{Result, bail};
-use api::{Flags, Socket, Token};
+//! Packet meter example - measures packet capture rate
+//!
+//! This example demonstrates using nethuns-rs to capture packets and
+//! measure throughput on a network interface.
+//!
+//! # Usage
+//!
+//! On macOS (pcap only):
+//! ```bash
+//! sudo cargo run --example meter -- -i en0 pcap
+//! ```
+//!
+//! On Linux with AF_XDP:
+//! ```bash
+//! sudo cargo run --example meter --features af_xdp -- -i eth0 af-xdp
+//! ```
+
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use etherparse::{NetHeaders, PacketHeaders};
+use nethuns_rs::{api, api::Socket, pcap};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use nethuns_rs::{af_xdp, api, dpdk, netmap, pcap};
+// Conditional imports for platform-specific backends
+#[cfg(all(target_os = "linux", feature = "af_xdp"))]
+use nethuns_rs::af_xdp;
+#[cfg(all(target_os = "linux", feature = "dpdk"))]
+use nethuns_rs::dpdk;
+#[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
+use nethuns_rs::netmap;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -37,6 +59,10 @@ struct Args {
     #[clap(short, long)]
     debug: bool,
 
+    /// Use batched statistics (more efficient at high packet rates, but less accurate at low rates).
+    #[clap(short = 'b', long)]
+    batch_stats: bool,
+
     /// Choose the network framework.
     #[clap(subcommand)]
     framework: Framework,
@@ -44,14 +70,18 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Framework {
-    /// Use netmap framework.
+    /// Use netmap framework (Linux/FreeBSD only)
+    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
     Netmap(NetmapArgs),
-    /// Use AF_XDP framework.
+    /// Use AF_XDP framework (Linux only)
+    #[cfg(all(target_os = "linux", feature = "af_xdp"))]
     AfXdp(AfXdpArgs),
+    /// Use DPDK framework (Linux only)
+    #[cfg(all(target_os = "linux", feature = "dpdk"))]
     Dpdk(DpdkArgs),
+    /// Use pcap (available on all platforms)
     Pcap(PcapArgs),
 }
-
 
 /// Pcap-specific arguments.
 #[derive(Parser, Debug)]
@@ -80,6 +110,7 @@ struct PcapArgs {
 }
 
 /// Netmap-specific arguments.
+#[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
 #[derive(Parser, Debug)]
 struct NetmapArgs {
     /// Extra buffer size for netmap.
@@ -93,6 +124,7 @@ struct NetmapArgs {
     producer_buffer_size: usize,
 }
 
+#[cfg(all(target_os = "linux", feature = "dpdk"))]
 #[derive(Parser, Debug)]
 struct DpdkArgs {
     /// Extra buffer size for netmap.
@@ -117,6 +149,7 @@ struct DpdkArgs {
 }
 
 /// AF_XDP-specific arguments.
+#[cfg(all(target_os = "linux", feature = "af_xdp"))]
 #[derive(Parser, Debug)]
 struct AfXdpArgs {
     /// Bind flags for AF_XDP.
@@ -149,6 +182,7 @@ fn print_addrs(frame: &[u8]) -> Result<String> {
 }
 
 fn run<Sock: Socket + 'static>(flags: Sock::Flags, args: &Args) -> Result<()> {
+    let use_batching = args.batch_stats;
     println!("Test {} started with parameters:", args.interface);
     println!("* interface: {}", args.interface);
     println!("* sockets: {}", args.sockets);
@@ -226,6 +260,8 @@ fn run<Sock: Socket + 'static>(flags: Sock::Flags, args: &Args) -> Result<()> {
 
     // Spawn packet-receiving threads.
     let mut handles = Vec::new();
+    // BULK determines how often we update the shared atomic counter.
+    // Using batched updates reduces contention on the atomic counter.
     const BULK: u64 = 10000;
     if args.multithreading {
         // One thread per socket.
@@ -233,19 +269,39 @@ fn run<Sock: Socket + 'static>(flags: Sock::Flags, args: &Args) -> Result<()> {
             let term_thread = term.clone();
             let counter = totals[i].clone();
             let debug = args.debug;
-            let handle = {
-                //let ctx = socket.context().clone();
+            let handle = if use_batching {
                 thread::spawn(move || {
-                    let mut local_counter = 0;
+                    let mut local_counter = 0u64;
                     while !term_thread.load(Ordering::SeqCst) {
-                        local_counter += 1;
-                        if local_counter == BULK {
-                            counter.fetch_add(local_counter, Ordering::SeqCst);
-                            local_counter = 0;
-                        }
-
                         let res: Option<()> = (|| {
-                            let (pkt, meta) = socket.recv().ok()?;
+                            let (pkt, _meta) = socket.recv().ok()?;
+                            local_counter += 1;
+                            // Flush to shared counter every BULK packets.
+                            // Using >= is defensive; with += 1 it's equivalent to ==.
+                            if local_counter >= BULK {
+                                counter.fetch_add(local_counter, Ordering::Relaxed);
+                                local_counter = 0;
+                            }
+                            if debug {
+                                if let Ok(info) = print_addrs(&pkt) {
+                                    println!("Thread {}: {}", i, info);
+                                }
+                            }
+                            Some(())
+                        })();
+                        if res.is_none() {
+                            // Optionally handle the error here.
+                        }
+                    }
+                    // Flush remaining count
+                    counter.fetch_add(local_counter, Ordering::Relaxed);
+                })
+            } else {
+                thread::spawn(move || {
+                    while !term_thread.load(Ordering::SeqCst) {
+                        let res: Option<()> = (|| {
+                            let (pkt, _meta) = socket.recv().ok()?;
+                            counter.fetch_add(1, Ordering::Relaxed);
                             if debug {
                                 if let Ok(info) = print_addrs(&pkt) {
                                     println!("Thread {}: {}", i, info);
@@ -267,24 +323,16 @@ fn run<Sock: Socket + 'static>(flags: Sock::Flags, args: &Args) -> Result<()> {
         let totals = Arc::new(totals);
         let term_loop = term.clone();
         let debug = args.debug;
-        let handle = thread::spawn(move || {
-            let mut local_counters = vec![0; sockets.len()];
-            while !term_loop.load(Ordering::Acquire) {
-                for _ in 0..1000 {
+        let handle = if use_batching {
+            thread::spawn(move || {
+                let mut local_counters = vec![0u64; sockets.len()];
+                while !term_loop.load(Ordering::Acquire) {
                     for (i, socket) in sockets.iter_mut().enumerate() {
                         let res: Option<()> = (|| {
-                            let (packet, meta) = socket.recv().ok()?;
-                            // let tmp = socket.recv();
-                            // let (packet, meta) = match tmp {
-                            //     Ok((packet, meta)) => (packet, meta),
-                            //     Err(err) => {
-                            //         println!("{:?}", err);
-                            //         return None;
-                            //     }
-                            // };
-
+                            let (packet, _meta) = socket.recv().ok()?;
                             local_counters[i] += 1;
-                            if local_counters[i] == BULK {
+                            // Flush to shared counter every BULK packets
+                            if local_counters[i] >= BULK {
                                 totals[i].fetch_add(local_counters[i], Ordering::Relaxed);
                                 local_counters[i] = 0;
                             }
@@ -296,12 +344,36 @@ fn run<Sock: Socket + 'static>(flags: Sock::Flags, args: &Args) -> Result<()> {
                             Some(())
                         })();
                         if res.is_none() {
-                            // Optionally handle the error here.
+                            // No packet available
                         }
                     }
                 }
-            }
-        });
+                // Flush remaining counts
+                for (i, &count) in local_counters.iter().enumerate() {
+                    totals[i].fetch_add(count, Ordering::Relaxed);
+                }
+            })
+        } else {
+            thread::spawn(move || {
+                while !term_loop.load(Ordering::Acquire) {
+                    for (i, socket) in sockets.iter_mut().enumerate() {
+                        let res: Option<()> = (|| {
+                            let (packet, _meta) = socket.recv().ok()?;
+                            totals[i].fetch_add(1, Ordering::Relaxed);
+                            if debug {
+                                if let Ok(info) = print_addrs(&*packet) {
+                                    println!("Socket {}: {}", i, info);
+                                }
+                            }
+                            Some(())
+                        })();
+                        if res.is_none() {
+                            // No packet available
+                        }
+                    }
+                }
+            })
+        };
         handles.push(handle);
     }
 
@@ -317,12 +389,14 @@ fn run<Sock: Socket + 'static>(flags: Sock::Flags, args: &Args) -> Result<()> {
 pub fn main() -> Result<()> {
     let args = Args::parse();
     match &args.framework {
+        #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
         Framework::Netmap(netmap_args) => {
             let flags = netmap::NetmapFlags {
                 extra_buf: netmap_args.extra_buf,
             };
             run::<netmap::Sock>(flags, &args)?;
         }
+        #[cfg(all(target_os = "linux", feature = "af_xdp"))]
         Framework::AfXdp(af_xdp_args) => {
             let flags = af_xdp::AfXdpFlags {
                 bind_flags: af_xdp_args.bind_flags,
@@ -334,6 +408,7 @@ pub fn main() -> Result<()> {
             };
             run::<af_xdp::Sock>(flags, &args)?;
         }
+        #[cfg(all(target_os = "linux", feature = "dpdk"))]
         Framework::Dpdk(dpdk_args) => {
             let flags = dpdk::DpdkFlags {
                 num_mbufs: dpdk_args.num_mbufs,
@@ -354,7 +429,6 @@ pub fn main() -> Result<()> {
             };
             run::<pcap::Sock>(flags, &args)?;
         }
-        _ => bail!("Unsupported framework"),
     }
     Ok(())
 }

@@ -1,18 +1,35 @@
-use anyhow::{Result, bail};
+//! Packet forwarder example - forwards packets between interfaces
+//!
+//! This example demonstrates using nethuns-rs to forward packets
+//! from one network interface to another.
+//!
+//! # Usage
+//!
+//! On macOS (pcap only):
+//! ```bash
+//! sudo cargo run --example forward -- en0 en1 pcap
+//! ```
+//!
+//! On Linux with netmap:
+//! ```bash
+//! sudo cargo run --example forward --features netmap -- eth0 eth1 netmap
+//! ```
+
+use anyhow::Result;
 use clap::{Parser, Subcommand};
+use nethuns_rs::{api::Socket, pcap};
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
 };
 use std::thread;
 use std::time::Duration;
 
-// Import the framework APIs.
-use nethuns_rs::{
-    af_xdp,
-    api::{Flags, Socket},
-    netmap,
-};
+// Conditional imports for platform-specific backends
+#[cfg(all(target_os = "linux", feature = "af_xdp"))]
+use nethuns_rs::af_xdp;
+#[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
+use nethuns_rs::netmap;
 
 /// Command-line arguments.
 #[derive(Parser, Debug)]
@@ -21,11 +38,16 @@ struct Args {
     /// Input interface name.
     in_if: String,
 
-    // Queue
-    queue: Option<usize>,
-
     /// Output interface name.
     out_if: String,
+
+    /// Queue number (optional)
+    #[clap(short, long)]
+    queue: Option<usize>,
+
+    /// Enable verbose mode (log errors)
+    #[clap(short, long)]
+    verbose: bool,
 
     /// Choose the network framework.
     #[clap(subcommand)]
@@ -34,13 +56,18 @@ struct Args {
 
 #[derive(Subcommand, Debug, Clone)]
 enum Framework {
-    /// Use netmap framework.
+    /// Use netmap framework (Linux/FreeBSD only)
+    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
     Netmap(NetmapArgs),
-    /// Use AF_XDP framework.
+    /// Use AF_XDP framework (Linux only)
+    #[cfg(all(target_os = "linux", feature = "af_xdp"))]
     AfXdp(AfXdpArgs),
+    /// Use pcap (available on all platforms)
+    Pcap(PcapArgs),
 }
 
 /// Netmap-specific arguments.
+#[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
 #[derive(Parser, Debug, Clone)]
 struct NetmapArgs {
     /// Extra buffer size for netmap.
@@ -53,6 +80,7 @@ struct NetmapArgs {
 }
 
 /// AF_XDP-specific arguments.
+#[cfg(all(target_os = "linux", feature = "af_xdp"))]
 #[derive(Parser, Debug, Clone)]
 struct AfXdpArgs {
     /// Bind flags for AF_XDP.
@@ -61,6 +89,20 @@ struct AfXdpArgs {
     /// XDP flags for AF_XDP.
     #[clap(long, default_value_t = 0)]
     xdp_flags: u32,
+}
+
+/// Pcap-specific arguments.
+#[derive(Parser, Debug, Clone)]
+struct PcapArgs {
+    /// Snaplen passed to libpcap.
+    #[clap(long, default_value_t = 65535)]
+    snaplen: i32,
+    /// Promiscuous mode.
+    #[clap(long, default_value_t = true)]
+    promiscuous: bool,
+    /// Read timeout in milliseconds.
+    #[clap(long, default_value_t = 1)]
+    timeout_ms: i32,
 }
 
 pub fn main() -> Result<()> {
@@ -79,12 +121,14 @@ pub fn main() -> Result<()> {
 
     // Choose the proper framework and run the forwarder.
     match args.framework.clone() {
+        #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
         Framework::Netmap(netmap_args) => {
             let flags = netmap::NetmapFlags {
                 extra_buf: netmap_args.extra_buf,
             };
-            run_forwarder::<netmap::Sock>(flags, &args, term)
+            run_forwarder::<netmap::Sock>(flags, &args, term, args.verbose)
         }
+        #[cfg(all(target_os = "linux", feature = "af_xdp"))]
         Framework::AfXdp(af_xdp_args) => {
             let flags = af_xdp::AfXdpFlags {
                 bind_flags: af_xdp_args.bind_flags,
@@ -94,7 +138,19 @@ pub fn main() -> Result<()> {
                 tx_size: 2048,
                 rx_size: 2048,
             };
-            run_forwarder::<af_xdp::Sock>(flags, &args, term)
+            run_forwarder::<af_xdp::Sock>(flags, &args, term, args.verbose)
+        }
+        Framework::Pcap(pcap_args) => {
+            let flags = pcap::PcapFlags {
+                snaplen: pcap_args.snaplen,
+                promiscuous: pcap_args.promiscuous,
+                timeout_ms: pcap_args.timeout_ms,
+                immediate: true,
+                filter: None,
+                buffer_size: 2048,
+                buffer_count: 32,
+            };
+            run_forwarder::<pcap::Sock>(flags, &args, term, args.verbose)
         }
     }
 }
@@ -104,7 +160,12 @@ pub fn main() -> Result<()> {
 /// This function creates an input and an output socket, spawns a meter thread,
 /// then enters a loop where it receives a packet on the input interface, and forwards it
 /// to the output interface using a retry loop.
-fn run_forwarder<Sock>(flags: Sock::Flags, args: &Args, term: Arc<AtomicBool>) -> Result<()>
+fn run_forwarder<Sock>(
+    flags: Sock::Flags,
+    args: &Args,
+    term: Arc<AtomicBool>,
+    verbose: bool,
+) -> Result<()>
 where
     Sock: Socket + 'static,
 {
@@ -114,7 +175,7 @@ where
 
     // Create the input and output sockets using the selected framework.
     let in_socket = Sock::create(&args.in_if, args.queue, flags.clone())?;
-    let out_socket = Sock::create(&args.out_if, args.queue, flags.clone())?;
+    let out_socket = Sock::create(&args.out_if, args.queue, flags)?;
 
     // Atomic counters for received and forwarded packets.
     let total_rcv = Arc::new(AtomicU64::new(0));
@@ -146,10 +207,12 @@ where
     // Forwarding loop.
     while !term.load(Ordering::SeqCst) {
         // Receive a packet from the input socket.
-        let (packet, meta) = match in_socket.recv() {
+        let (packet, _meta) = match in_socket.recv() {
             Ok((p, m)) => (p, m),
             Err(e) => {
-                eprintln!("Receive error: {:?}", e);
+                if verbose {
+                    eprintln!("recv error: {}", e);
+                }
                 continue;
             }
         };
@@ -158,9 +221,11 @@ where
         // Forward the packet with a retry loop.
         loop {
             match out_socket.send(&packet) {
-                // On success, exit the retry loop.
                 Ok(_) => break,
                 Err(e) => {
+                    if verbose {
+                        eprintln!("send error: {}, flushing...", e);
+                    }
                     out_socket.flush();
                 }
             }

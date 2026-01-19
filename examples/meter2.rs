@@ -11,7 +11,17 @@ use std::thread;
 use std::time::Duration;
 
 use nethuns_rs::api::Context;
-use nethuns_rs::{af_xdp, api, dpdk, netmap};
+use nethuns_rs::api;
+use nethuns_rs::pcap;
+use nethuns_rs::pcap::PcapFlags;
+
+// Conditional imports for platform-specific backends
+#[cfg(all(target_os = "linux", feature = "af_xdp"))]
+use nethuns_rs::af_xdp;
+#[cfg(all(target_os = "linux", feature = "dpdk"))]
+use nethuns_rs::dpdk;
+#[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
+use nethuns_rs::netmap;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -47,13 +57,20 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Framework {
     /// Use netmap framework.
+    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
     Netmap(NetmapArgs),
     /// Use AF_XDP framework.
+    #[cfg(all(target_os = "linux", feature = "af_xdp"))]
     AfXdp(AfXdpArgs),
+    /// Use DPDK framework.
+    #[cfg(all(target_os = "linux", feature = "dpdk"))]
     Dpdk(DpdkArgs),
+    /// Use pcap framework.
+    Pcap(PcapArgs),
 }
 
 /// Netmap-specific arguments.
+#[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
 #[derive(Parser, Debug)]
 struct NetmapArgs {
     /// Extra buffer size for netmap.
@@ -67,10 +84,10 @@ struct NetmapArgs {
     producer_buffer_size: usize,
 }
 
+/// DPDK-specific arguments.
+#[cfg(all(target_os = "linux", feature = "dpdk"))]
 #[derive(Parser, Debug)]
 struct DpdkArgs {
-    /// Extra buffer size for netmap.
-
     // num_mbufs: 8192,
     #[clap(long, default_value_t = 8192)]
     num_mbufs: u32,
@@ -91,6 +108,7 @@ struct DpdkArgs {
 }
 
 /// AF_XDP-specific arguments.
+#[cfg(all(target_os = "linux", feature = "af_xdp"))]
 #[derive(Parser, Debug)]
 struct AfXdpArgs {
     /// Bind flags for AF_XDP.
@@ -99,6 +117,32 @@ struct AfXdpArgs {
     /// XDP flags for AF_XDP.
     #[clap(long, default_value_t = 0)]
     xdp_flags: u32,
+}
+
+/// Pcap-specific arguments.
+#[derive(Parser, Debug)]
+struct PcapArgs {
+    /// Snaplen passed to libpcap.
+    #[clap(long, default_value_t = 65535)]
+    snaplen: i32,
+    /// Promiscuous mode.
+    #[clap(long, default_value_t = true)]
+    promiscuous: bool,
+    /// Read timeout in milliseconds (for live captures).
+    #[clap(long, default_value_t = 1)]
+    timeout_ms: i32,
+    /// libpcap immediate mode (deliver packets as soon as they arrive).
+    #[clap(long, default_value_t = true)]
+    immediate: bool,
+    /// Optional BPF filter (tcpdump syntax).
+    #[clap(long)]
+    filter: Option<String>,
+    /// Size of each buffer in the pool (bytes).
+    #[clap(long, default_value_t = 2048)]
+    buffer_size: usize,
+    /// Initial number of buffers to preallocate.
+    #[clap(long, default_value_t = 32)]
+    buffer_count: usize,
 }
 
 /// Try to parse Ethernet/IP headers using etherparse and return a formatted string.
@@ -246,12 +290,14 @@ fn run<Sock: Socket + 'static>(flags: Sock::Flags, args: &Args) -> Result<()> {
 pub fn main() -> Result<()> {
     let args = Args::parse();
     match &args.framework {
+        #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
         Framework::Netmap(netmap_args) => {
             let flags = netmap::NetmapFlags {
                 extra_buf: netmap_args.extra_buf,
             };
             run::<netmap::Sock>(flags, &args)?;
         }
+        #[cfg(all(target_os = "linux", feature = "af_xdp"))]
         Framework::AfXdp(af_xdp_args) => {
             let flags = af_xdp::AfXdpFlags {
                 bind_flags: af_xdp_args.bind_flags,
@@ -263,6 +309,7 @@ pub fn main() -> Result<()> {
             };
             run::<af_xdp::Sock>(flags, &args)?;
         }
+        #[cfg(all(target_os = "linux", feature = "dpdk"))]
         Framework::Dpdk(dpdk_args) => {
             let flags = dpdk::DpdkFlags {
                 num_mbufs: dpdk_args.num_mbufs,
@@ -271,7 +318,18 @@ pub fn main() -> Result<()> {
             };
             run::<dpdk::Sock>(flags, &args)?;
         }
-        _ => bail!("Unsupported framework"),
+        Framework::Pcap(pcap_args) => {
+            let flags = PcapFlags {
+                snaplen: pcap_args.snaplen,
+                promiscuous: pcap_args.promiscuous,
+                timeout_ms: pcap_args.timeout_ms,
+                immediate: pcap_args.immediate,
+                filter: pcap_args.filter.clone(),
+                buffer_size: pcap_args.buffer_size,
+                buffer_count: pcap_args.buffer_count,
+            };
+            run::<pcap::Sock>(flags, &args)?;
+        }
     }
     Ok(())
 }

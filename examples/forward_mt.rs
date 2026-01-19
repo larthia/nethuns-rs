@@ -3,7 +3,13 @@ use arrayvec::ArrayVec;
 use clap::{Parser, Subcommand};
 use nethuns_rs::api::{NethunsPusher, Payload, Socket};
 use nethuns_rs::pcap::PcapFlags;
-use nethuns_rs::{af_xdp, netmap, pcap};
+use nethuns_rs::pcap;
+
+// Conditional imports for platform-specific backends
+#[cfg(all(target_os = "linux", feature = "af_xdp"))]
+use nethuns_rs::af_xdp;
+#[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
+use nethuns_rs::netmap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -31,14 +37,17 @@ struct Args {
 #[derive(Subcommand, Debug, Clone)]
 enum Framework {
     /// Use netmap framework.
+    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
     Netmap(NetmapArgs),
     /// Use AF_XDP framework.
+    #[cfg(all(target_os = "linux", feature = "af_xdp"))]
     AfXdp(AfXdpArgs),
     /// Use pcap framework.
     Pcap(PcapArgs),
 }
 
 /// Netmap–specific arguments.
+#[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
 #[derive(Parser, Debug, Clone)]
 struct NetmapArgs {
     #[clap(long, default_value_t = 1024)]
@@ -50,6 +59,7 @@ struct NetmapArgs {
 }
 
 /// AF_XDP–specific arguments.
+#[cfg(all(target_os = "linux", feature = "af_xdp"))]
 #[derive(Parser, Debug, Clone)]
 struct AfXdpArgs {
     /// Bind flags for AF_XDP.
@@ -191,12 +201,14 @@ pub fn main() -> Result<()> {
 
     // Choose the proper framework and call the generic run_queue function.
     match &args.framework {
+        #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "netmap"))]
         Framework::Netmap(netmap_args) => {
             let flags = netmap::NetmapFlags {
                 extra_buf: netmap_args.extra_buf,
             };
             run_queue::<netmap::Sock>(flags, &args, term)?;
         }
+        #[cfg(all(target_os = "linux", feature = "af_xdp"))]
         Framework::AfXdp(af_xdp_args) => {
             let flags = af_xdp::AfXdpFlags {
                 bind_flags: af_xdp_args.bind_flags,
