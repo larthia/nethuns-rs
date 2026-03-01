@@ -32,6 +32,14 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    // dpdk is Linux-only — skip the build on other platforms.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        // Write an empty bindings file so that include!() in lib.rs compiles.
+        let out_path = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+        std::fs::write(out_path.join("bindings.rs"), "").expect("Couldn't write empty bindings");
+        return;
+    }
+
     println!("cargo:rerun-if-changed=lib.c");
     println!("cargo:rerun-if-changed=lib.h");
     // Use pkg-config to locate the dpdk library and get its compile options.

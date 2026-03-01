@@ -114,6 +114,14 @@ use std::process::Command;
 const WRAPPER: &str = "netmap.h";
 
 fn main() {
+    // netmap is Linux-only — skip the build on other platforms.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        // Write an empty bindings file so that include!() in lib.rs compiles.
+        let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+        std::fs::write(out_path.join("bindings.rs"), "").expect("Couldn't write empty bindings");
+        return;
+    }
+
     println!("cargo:rerun-if-changed={WRAPPER}");
     println!("cargo:rerun-if-env-changed=NETMAP_LIB_DIR");
     println!("cargo:rerun-if-env-changed=NETMAP_INCLUDE_DIR");

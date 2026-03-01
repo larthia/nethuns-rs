@@ -3,6 +3,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command};
 
 fn main() {
+    // libxdp/libbpf are Linux-only — skip the build on other platforms.
+    // rust-analyzer and other tools on macOS will still be able to load
+    // the crate (with empty bindings) without failing.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        return;
+    }
+
     // Re-run hints
     println!("cargo:rerun-if-changed=bindings.h");
     println!("cargo:rerun-if-env-changed=CFLAGS");
